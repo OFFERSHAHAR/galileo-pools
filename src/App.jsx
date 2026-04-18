@@ -30,11 +30,22 @@ const daysLeft = s => s ? Math.ceil((new Date(s)-new Date())/864e5) : null;
 const nowStr   = () => new Date().toLocaleString("he-IL");
 
 // ─── Google Apps Script API ────────────────────────────────────────────────
-const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzKKk_M0noXnKrniCsBDO4dAUWPDkpK8YH0QhhpJQfSaCyfqmAQlLJOb-sN5atSj5nj/exec";
+const FIXED_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzKKk_M0noXnKrniCsBDO4dAUWPDkpK8YH0QhhpJQfSaCyfqmAQlLJOb-sN5atSj5nj/exec";
+const STORAGE_KEY_URL  = "galileo_script_url";
+
+function getScriptUrl() {
+  return localStorage.getItem(STORAGE_KEY_URL) || FIXED_SCRIPT_URL;
+}
+
+function saveScriptUrl(url) {
+  localStorage.setItem(STORAGE_KEY_URL, url);
+}
 
 async function sheetCall(action, payload={}) {
+  const url = getScriptUrl();
+  if (!url) return null;
   try {
-    const r = await fetch(SCRIPT_URL, {
+    const r = await fetch(url, {
       method:"POST",
       headers:{"Content-Type":"text/plain"},
       body: JSON.stringify({ action, ...payload })
@@ -158,6 +169,8 @@ export default function App() {
   // ── Sheets ────────────────────────────────────────────────────────
   const [sheetId,      setSheetId]      = useState("");
   const [sheetsStatus, setSheetsStatus] = useState("idle");
+  const [scriptUrl,    setScriptUrlState] = useState(getScriptUrl);
+  const [scriptInput,  setScriptInput]  = useState(getScriptUrl());
   const [allUsers,     setAllUsers]     = useState(DEMO_USERS);
   const [clients,      setClients]      = useState(DEMO_CLIENTS); // [{name,phone}]
   const [tasks,        setTasks]        = useState([]); // [{id,date,client,operators:[],status,changeLog:[]}]
@@ -183,12 +196,48 @@ export default function App() {
           poolStatus,customStatusText,restrictedUntil,notes,photos } = form;
 
   // ── Admin panel ───────────────────────────────────────────────────
-  const [adminTab,     setAdminTab]     = useState("daily"); // daily|progress|users
+  const [adminTab,     setAdminTab]     = useState("daily"); // daily|progress|users|hours
   const [taskDate,     setTaskDate]     = useState(todayStr());
   const [taskClient,   setTaskClient]   = useState("");
   const [taskOps,      setTaskOps]      = useState([]); // selected operator names
   const [taskNote,     setTaskNote]     = useState("");
   const [editTaskId,   setEditTaskId]   = useState(null);
+
+  // ── Hours tracking ────────────────────────────────────────────────
+  const [workLogs,  setWorkLogs]  = useState(() => {
+    try { return JSON.parse(localStorage.getItem("galileo_worklogs")||"[]"); } catch { return []; }
+  });
+  const [workStart, setWorkStart] = useState(() => {
+    return localStorage.getItem("galileo_workstart")||null;
+  });
+
+  const saveWorkLogs = (logs) => {
+    setWorkLogs(logs);
+    localStorage.setItem("galileo_worklogs", JSON.stringify(logs));
+  };
+
+  const handleStartWork = () => {
+    const now = new Date().toLocaleTimeString("he-IL",{hour:"2-digit",minute:"2-digit"});
+    localStorage.setItem("galileo_workstart", now);
+    setWorkStart(now);
+  };
+
+  const handleEndWork = () => {
+    if (!workStart) return;
+    const endTime = new Date().toLocaleTimeString("he-IL",{hour:"2-digit",minute:"2-digit"});
+    const [sh,sm] = workStart.split(":").map(Number);
+    const [eh,em] = endTime.split(":").map(Number);
+    const totalMins = (eh*60+em) - (sh*60+sm);
+    const hours = Math.floor(totalMins/60);
+    const mins  = totalMins%60;
+    const totalStr = `${hours}:${String(mins).padStart(2,"0")}`;
+    const log = { id:Date.now(), operator:user?.name, date:todayStr(), start:workStart, end:endTime, total:totalStr };
+    const newLogs = [...workLogs, log];
+    saveWorkLogs(newLogs);
+    localStorage.removeItem("galileo_workstart");
+    setWorkStart(null);
+    if (sheetId) sheetCall("saveWorkLog", { log });
+  };
 
   // ── Daily board ───────────────────────────────────────────────────
   const [dailyDate,    setDailyDate]    = useState(todayStr());
@@ -230,6 +279,13 @@ export default function App() {
   // ══ Login ═════════════════════════════════════════════════════════
   const handleLogin = async () => {
     setLoginErr(""); setLoginLoading(true);
+
+    // If scriptUrl exists, fetch users from sheets first
+    if (scriptUrl) {
+      await connectSheets();
+    }
+
+    // Use updated allUsers (from sheets or demo)
     const found = allUsers.find(u=>u.username.toLowerCase()===loginUser.toLowerCase().trim() && u.password.toLowerCase()===loginPass.toLowerCase().trim());
     if (found) {
       setUser(found);
@@ -415,19 +471,33 @@ _צוות גליליאו_`;
           <p style={{color:"#475569",fontSize:13,margin:"6px 0 0"}}>מערכת ניהול בריכות</p>
         </div>
 
-        {/* Sheets connect (optional before login) */}
-        {sheetsStatus==="idle" && (
-          <div style={{...CARD(),marginBottom:20,display:"flex",alignItems:"center",gap:10,cursor:"pointer"}} onClick={connectSheets}>
-            <span style={{fontSize:20}}>📊</span>
-            <div style={{flex:1}}>
-              <div style={{color:"#7dd3fc",fontSize:13,fontWeight:800}}>חבר ל-Google Sheets</div>
-              <div style={{color:"#475569",fontSize:11}}>לניהול משתמשים מהגיליון</div>
+        {/* Sheets connect */}
+        {!scriptUrl ? (
+          <div style={{...CARD({border:"1px solid rgba(14,165,233,0.3)"}),marginBottom:20,padding:20}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+              <span style={{fontSize:20}}>📊</span>
+              <span style={{color:"#7dd3fc",fontWeight:800,fontSize:14}}>חיבור ל-Google Sheets</span>
             </div>
-            <span style={{color:"#7dd3fc",fontSize:13,fontWeight:700}}>חבר</span>
+            <div style={{color:"#64748b",fontSize:12,marginBottom:10}}>הכנס את כתובת ה-Apps Script של הגיליון שלך</div>
+            <input value={scriptInput} onChange={e=>setScriptInput(e.target.value)}
+              placeholder="https://script.google.com/macros/s/..."
+              style={{...INP,marginBottom:10,fontSize:12}}/>
+            <button onClick={()=>{
+              if(!scriptInput.includes("script.google.com")) return;
+              saveScriptUrl(scriptInput);
+              setScriptUrlState(scriptInput);
+            }} style={{width:"100%",padding:"10px",borderRadius:10,border:"none",cursor:"pointer",fontSize:14,fontWeight:800,background:"linear-gradient(135deg,#0284c7,#06b6d4)",color:"#fff"}}>
+              שמור וחבר
+            </button>
+          </div>
+        ) : (
+          <div style={{...CARD({border:"1px solid rgba(34,197,94,0.25)"}),marginBottom:20,display:"flex",alignItems:"center",gap:10,padding:"12px 16px"}}>
+            <span style={{fontSize:16}}>✅</span>
+            <span style={{color:"#4ade80",fontSize:13,fontWeight:700,flex:1}}>מחובר ל-Google Sheets</span>
+            <button onClick={()=>{saveScriptUrl("");setScriptUrlState("");setScriptInput("");}}
+              style={{background:"none",border:"none",color:"#475569",cursor:"pointer",fontSize:12}}>שנה</button>
           </div>
         )}
-        {sheetsStatus==="connecting"&&<div style={{...CARD(),marginBottom:20,color:"#7dd3fc",fontSize:13,fontWeight:700,textAlign:"center",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}><span style={{animation:"spin 1s linear infinite",display:"inline-block"}}>🔄</span>מתחבר...</div>}
-        {sheetsStatus==="ready"&&<div style={{...CARD({border:"1px solid rgba(34,197,94,0.3)"}),marginBottom:20,color:"#4ade80",fontSize:13,fontWeight:700,textAlign:"center"}}>✅ מחובר ל-Google Sheets</div>}
 
         <div style={{...CARD(),padding:24}}>
           <div style={{marginBottom:14}}>
@@ -483,8 +553,8 @@ _צוות גליליאו_`;
 
           {/* Tabs */}
           <div style={{display:"flex",gap:6,marginBottom:22,background:"rgba(255,255,255,0.04)",borderRadius:12,padding:5}}>
-            {[["daily","📋 חלוקת עבודה"],["progress","📊 התקדמות"],["users","👥 משתמשים"]].map(([t,lbl])=>(
-              <button key={t} onClick={()=>setAdminTab(t)} style={{flex:1,padding:"9px 4px",borderRadius:9,border:"none",cursor:"pointer",fontSize:13,fontWeight:700,
+            {[["daily","📋 חלוקת עבודה"],["progress","📊 התקדמות"],["hours","⏱️ שעות"],["users","👥 משתמשים"]].map(([t,lbl])=>(
+              <button key={t} onClick={()=>setAdminTab(t)} style={{flex:1,padding:"9px 4px",borderRadius:9,border:"none",cursor:"pointer",fontSize:12,fontWeight:700,
                 background:adminTab===t?"linear-gradient(135deg,#0284c7,#06b6d4)":"transparent",color:adminTab===t?"#fff":"#64748b",transition:"all 0.15s"}}>
                 {lbl}
               </button>
@@ -643,6 +713,47 @@ _צוות גליליאו_`;
             </div>
           )}
 
+          {/* ── TAB: hours ── */}
+          {adminTab==="hours" && (
+            <div>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18}}>
+                <label style={{color:"#64748b",fontSize:12,fontWeight:700}}>תאריך:</label>
+                <input type="date" value={dailyDate} onChange={e=>setDailyDate(e.target.value)}
+                  style={{...INP,maxWidth:160,color:"#7dd3fc",border:"1px solid rgba(14,165,233,0.3)",fontWeight:700}}/>
+              </div>
+
+              {operatorUsers.map(op=>{
+                const dayLogs = workLogs.filter(l=>l.operator===op.name && l.date===dailyDate);
+                const totalMins = dayLogs.reduce((acc,l)=>{
+                  const [h,m] = l.total.split(":").map(Number);
+                  return acc + h*60 + m;
+                },0);
+                const totalStr = totalMins>0 ? `${Math.floor(totalMins/60)}:${String(totalMins%60).padStart(2,"0")}` : "—";
+
+                return (
+                  <div key={op.name} style={{...CARD(),marginBottom:12}}>
+                    <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:dayLogs.length?12:0}}>
+                      <span style={{fontSize:24}}>{op.icon}</span>
+                      <div style={{flex:1}}>
+                        <div style={{color:"#fff",fontWeight:700,fontSize:15}}>{op.name}</div>
+                        <div style={{color:"#475569",fontSize:11}}>
+                          {dayLogs.length===0?"לא נרשמה עבודה היום":`${dayLogs.length} סשנים · סה"כ ${totalStr} שעות`}
+                        </div>
+                      </div>
+                      {totalMins>0 && <Badge label={`⏱️ ${totalStr}`} col="#7dd3fc"/>}
+                    </div>
+                    {dayLogs.map((l,i)=>(
+                      <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderTop:"1px solid rgba(255,255,255,0.05)"}}>
+                        <span style={{color:"#64748b",fontSize:12}}>🕐 {l.start} — {l.end}</span>
+                        <span style={{color:"#7dd3fc",fontSize:12,fontWeight:700}}>{l.total} שע׳</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {/* ── TAB: users ── */}
           {adminTab==="users" && (
             <div>
@@ -682,7 +793,7 @@ _צוות גליליאו_`;
       <div dir="rtl" style={BG}>
         <div style={WRAP}>
           {/* Personal card */}
-          <div style={{...CARD({background:"linear-gradient(135deg,rgba(14,165,233,0.12),rgba(6,182,212,0.06))",border:"1px solid rgba(14,165,233,0.2)"}),marginBottom:20,display:"flex",alignItems:"center",gap:14}}>
+          <div style={{...CARD({background:"linear-gradient(135deg,rgba(14,165,233,0.12),rgba(6,182,212,0.06))",border:"1px solid rgba(14,165,233,0.2)"}),marginBottom:16,display:"flex",alignItems:"center",gap:14}}>
             <span style={{fontSize:40}}>{user?.icon}</span>
             <div style={{flex:1}}>
               <div style={{color:"#fff",fontWeight:900,fontSize:17}}>{user?.name}</div>
@@ -690,6 +801,21 @@ _צוות גליליאו_`;
             </div>
             <button onClick={()=>{setUser(null);setScreen("login");}}
               style={{background:"rgba(255,255,255,0.06)",border:"none",borderRadius:9,padding:"6px 10px",color:"#64748b",cursor:"pointer",fontSize:12}}>יציאה</button>
+          </div>
+
+          {/* Work timer */}
+          <div style={{...CARD({border: workStart?"1px solid rgba(34,197,94,0.3)":"1px solid rgba(255,255,255,0.08)"}),marginBottom:16,display:"flex",alignItems:"center",gap:12}}>
+            <span style={{fontSize:24}}>{workStart?"⏱️":"🕐"}</span>
+            <div style={{flex:1}}>
+              {workStart
+                ? <><div style={{color:"#4ade80",fontWeight:800,fontSize:14}}>יום עבודה פעיל</div><div style={{color:"#64748b",fontSize:12}}>התחלה: {workStart}</div></>
+                : <><div style={{color:"#fff",fontWeight:700,fontSize:14}}>לא התחיל יום עבודה</div><div style={{color:"#64748b",fontSize:12}}>לחץ להתחיל</div></>
+              }
+            </div>
+            {!workStart
+              ? <button onClick={handleStartWork} style={{background:"linear-gradient(135deg,#0284c7,#06b6d4)",border:"none",borderRadius:10,padding:"9px 16px",color:"#fff",cursor:"pointer",fontSize:13,fontWeight:800}}>▶ התחלה</button>
+              : <button onClick={handleEndWork}   style={{background:"linear-gradient(135deg,#dc2626,#ef4444)",border:"none",borderRadius:10,padding:"9px 16px",color:"#fff",cursor:"pointer",fontSize:13,fontWeight:800}}>⏹ סיום</button>
+            }
           </div>
 
           {/* Date selector */}
