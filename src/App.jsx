@@ -29,17 +29,21 @@ const calcNext = (s,days=90) => { if(!s)return null; const d=new Date(s); d.setD
 const daysLeft = s => s ? Math.ceil((new Date(s)-new Date())/864e5) : null;
 const nowStr   = () => new Date().toLocaleString("he-IL");
 
-// ─── MCP ──────────────────────────────────────────────────────────────────
-const MCP = {type:"url",url:"https://drivemcp.googleapis.com/mcp/v1",name:"gdrive"};
-async function mcpCall(prompt) {
-  const r = await fetch("https://api.anthropic.com/v1/messages",{
-    method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1500,
-      system:"Use Google Drive/Sheets tools. Return ONLY valid JSON, no markdown or extra text.",
-      messages:[{role:"user",content:prompt}],mcp_servers:[MCP]})
-  });
-  const d = await r.json();
-  return (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+// ─── Google Apps Script API ────────────────────────────────────────────────
+const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzKKk_M0noXnKrniCsBDO4dAUWPDkpK8YH0QhhpJQfSaCyfqmAQlLJOb-sN5atSj5nj/exec";
+
+async function sheetCall(action, payload={}) {
+  try {
+    const r = await fetch(SCRIPT_URL, {
+      method:"POST",
+      headers:{"Content-Type":"text/plain"},
+      body: JSON.stringify({ action, ...payload })
+    });
+    return await r.json();
+  } catch(e) {
+    console.error("sheetCall error:", e);
+    return null;
+  }
 }
 function parseJSON(txt) {
   try { return JSON.parse(txt.replace(/```json|```/g,"").trim()); } catch { return null; }
@@ -202,53 +206,25 @@ export default function App() {
   const connectSheets = async () => {
     setSheetsStatus("connecting");
     try {
-      const txt = await mcpCall(
-        `Find or create Google Spreadsheet "גליליאו - מערכת ניהול בריכות" with sheets:
-         "Users" (columns: username,password,role,name,icon,welcomeMessage,phone),
-         "לקוחות" (columns: שם_לקוח, טלפון),
-         "דוחות" (columns: תאריך,מפעיל,לקוח,כלור,pH,מלח,גובהמים,צלילות,פסשומן,זרימה,אלקטרודהדגם,סריאלי,ניקיוןאחרון,ניקיוןהבא,ציוד,statusPool,statusText,restrictedUntil,הערות,ציון),
-         "משימות" (columns: id,date,client,operators,status,changeLog),
-         "ציוד_לקוחות" (columns: לקוח,חומצת_מלח,מעלה_pH,שקי_מלח,כמות,עודכן).
-         Return JSON: {"spreadsheetId":"..."}`
-      );
-      const p = parseJSON(txt);
-      if (!p?.spreadsheetId) throw new Error("no id");
-      setSheetId(p.spreadsheetId);
+      // fetch users
+      const uRes = await sheetCall("getUsers");
+      if (uRes?.users?.length) setAllUsers(uRes.users);
 
-      // fetch Users
-      const uTxt = await mcpCall(`Read all rows (skip header) from sheet "Users" in spreadsheet "${p.spreadsheetId}". Return JSON array of objects with keys: username,password,role,name,icon,welcomeMessage,phone`);
-      const us = parseJSON(uTxt);
-      if (Array.isArray(us)&&us.length) setAllUsers(us);
-
-      // fetch clients (name + phone + address)
-      const cTxt = await mcpCall(`Read columns A, B and C (skip header) of sheet "לקוחות" in spreadsheet "${p.spreadsheetId}". Return JSON array of objects with keys: name, phone, address`);
-      const cs = parseJSON(cTxt);
-      if (Array.isArray(cs)&&cs.length) setClients(cs);
+      // fetch clients
+      const cRes = await sheetCall("getClients");
+      if (cRes?.clients?.length) setClients(cRes.clients);
 
       // fetch tasks
-      const tTxt = await mcpCall(`Read all rows (skip header) from sheet "משימות" in spreadsheet "${p.spreadsheetId}". Return JSON array with keys: id,date,client,operators,status,changeLog`);
-      const ts = parseJSON(tTxt);
-      if (Array.isArray(ts)) setTasks(ts.map(t=>({...t, operators: typeof t.operators==="string"?t.operators.split(",").map(x=>x.trim()).filter(Boolean):t.operators||[], changeLog: typeof t.changeLog==="string"?JSON.parse(t.changeLog||"[]"):t.changeLog||[]})));
+      const tRes = await sheetCall("getTasks");
+      if (Array.isArray(tRes?.tasks)) setTasks(tRes.tasks);
 
-      // fetch supply DB (ציוד_לקוחות) → rebuild per-client supply map
-      const sTxt = await mcpCall(`Read all rows (skip header) from sheet "ציוד_לקוחות" in spreadsheet "${p.spreadsheetId}". Return JSON array of objects with keys: client, acid, phUp, saltPkg, saltBags, updatedAt`);
-      const sd = parseJSON(sTxt);
-      if (Array.isArray(sd) && sd.length) {
-        const db = {};
-        sd.forEach(row => {
-          if (row.client) db[row.client] = {
-            acid:    row.acid    === "כן",
-            phUp:    row.phUp    === "כן",
-            saltPkg: row.saltPkg === "כן",
-            saltBags: parseInt(row.saltBags)||1,
-            updatedAt: row.updatedAt||"",
-          };
-        });
-        setSupplyDB(db);
-      }
+      // fetch supply DB
+      const sRes = await sheetCall("getSupplyDB");
+      if (sRes?.supplyDB) setSupplyDB(sRes.supplyDB);
 
+      setSheetId("connected");
       setSheetsStatus("ready");
-    } catch { setSheetsStatus("error"); }
+    } catch(e) { setSheetsStatus("error"); }
   };
 
   // ══ Login ═════════════════════════════════════════════════════════
@@ -280,7 +256,7 @@ export default function App() {
     setEditTaskId(null); setTaskClient(""); setTaskOps([]); setTaskNote("");
     if (sheetId) {
       const rows = newTasks.map(t=>[t.id,t.date,t.client,t.operators.join(","),t.status,JSON.stringify(t.changeLog)]);
-      await mcpCall(`Clear sheet "משימות" in spreadsheet "${sheetId}" except header, then append rows: ${JSON.stringify(rows)}. Return {"success":true}`);
+      await sheetCall("saveTasks", { tasks: newTasks });
     }
   };
 
@@ -299,7 +275,7 @@ export default function App() {
     setTasks(newTasks);
     if (sheetId) {
       const rows = newTasks.map(t=>[t.id,t.date,t.client,t.operators.join(","),t.status,JSON.stringify(t.changeLog)]);
-      await mcpCall(`Clear sheet "משימות" in spreadsheet "${sheetId}" except header, then append rows: ${JSON.stringify(rows)}. Return {"success":true}`);
+      await sheetCall("saveTasks", { tasks: newTasks });
     }
   };
 
@@ -318,7 +294,7 @@ export default function App() {
     setTasks(newTasks);
     if (sheetId) {
       const rows = newTasks.map(t=>[t.id,t.date,t.client,t.operators.join(","),t.status,JSON.stringify(t.changeLog)]);
-      await mcpCall(`Clear sheet "משימות" in spreadsheet "${sheetId}" except header, then append rows: ${JSON.stringify(rows)}. Return {"success":true}`);
+      await sheetCall("saveTasks", { tasks: newTasks });
     }
   };
 
@@ -348,7 +324,7 @@ export default function App() {
       setSupplyDB(newDB);
       if(sheetId){
         const rows=Object.entries(newDB).map(([c,v])=>[c,v.acid?"כן":"לא",v.phUp?"כן":"לא",v.saltPkg?"כן":"לא",v.saltBags||0,v.updatedAt]);
-        await mcpCall(`Clear sheet "ציוד_לקוחות" in spreadsheet "${sheetId}" except header, then append rows: ${JSON.stringify(rows)}. Return {"success":true}`);
+        await sheetCall("saveSupplyDB", { rows });
       }
     }
 
@@ -371,12 +347,8 @@ export default function App() {
     setSyncing(true);
     let saved = false;
     if(sheetId){
-      const rows=[[ report.reportDate,report.operator,report.client,report.chlorine,report.ph,report.salt,
-        report.waterLevel,report.clarity,report.fat,report.flow,report.elModel,report.elSerial,
-        report.elDate,report.elNext,report.supplyLabel,report.poolStatus,report.customStatusText,
-        report.restrictedUntil,report.notes ]];
-      const ok = await mcpCall(`Append rows to sheet "דוחות" in spreadsheet "${sheetId}": ${JSON.stringify(rows)}. Return {"success":true}`).then(t=>t.includes("true")).catch(()=>false);
-      saved = ok;
+      const res = await sheetCall("saveReport", { report }).catch(()=>null);
+      saved = res?.success === true;
     }
     if(!saved){ setPending(p=>[...p,report]); setDismissed(false); }
     setSyncing(false);
@@ -396,9 +368,12 @@ export default function App() {
   const handleManualSync = async () => {
     if(!pending.length||!sheetId) return;
     setSyncing(true); setSyncMsg(null);
-    const rows=pending.map(r=>[r.reportDate,r.operator,r.client,r.chlorine,r.ph,r.salt,r.waterLevel,r.clarity,r.fat,r.flow,r.elModel,r.elSerial,r.elDate,r.elNext,r.supplyLabel,r.poolStatus,r.customStatusText,r.restrictedUntil,r.notes]);
-    const ok = await mcpCall(`Append rows to sheet "דוחות" in spreadsheet "${sheetId}": ${JSON.stringify(rows)}. Return {"success":true}`).then(t=>t.includes("true")).catch(()=>false);
-    if(ok){setPending([]);setSyncMsg("ok");}else setSyncMsg("fail");
+    let allOk = true;
+    for (const report of pending) {
+      const res = await sheetCall("saveReport", { report }).catch(()=>null);
+      if (!res?.success) allOk = false;
+    }
+    if(allOk){setPending([]);setSyncMsg("ok");}else setSyncMsg("fail");
     setSyncing(false);
     setTimeout(()=>setSyncMsg(null),4000);
   };
