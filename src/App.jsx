@@ -30,7 +30,7 @@ const daysLeft = s => s ? Math.ceil((new Date(s)-new Date())/864e5) : null;
 const nowStr   = () => new Date().toLocaleString("he-IL");
 
 // ─── Google Apps Script API ────────────────────────────────────────────────
-const FIXED_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzKKk_M0noXnKrniCsBDO4dAUWPDkpK8YH0QhhpJQfSaCyfqmAQlLJOb-sN5atSj5nj/exec";
+const FIXED_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzCCIaYlxPKOwN37ID8t38zdhykLIXHsDlHl8vJg-s2uKkencXUXdUxan-gqjYj8z_-Ug/exec";
 const STORAGE_KEY_URL  = "galileo_script_url";
 
 function getScriptUrl() {
@@ -252,28 +252,55 @@ export default function App() {
   const opList        = opNames;
 
   // ══ Sheets connect ════════════════════════════════════════════════
-  const connectSheets = async () => {
-    setSheetsStatus("connecting");
+  const connectSheets = async (background=false) => {
+    if (!background) setSheetsStatus("connecting");
+
+    // Load from cache immediately
     try {
-      // fetch users
-      const uRes = await sheetCall("getUsers");
-      if (uRes?.users?.length) setAllUsers(uRes.users);
+      const cached = localStorage.getItem("galileo_cache");
+      if (cached) {
+        const { users, clients, tasks, supplyDB: sdb } = JSON.parse(cached);
+        if (users?.length)   setAllUsers(users);
+        if (clients?.length) setClients(clients);
+        if (tasks)           setTasks(tasks);
+        if (sdb)             setSupplyDB(sdb);
+        setSheetId("connected");
+        setSheetsStatus("ready");
+        if (!background) return; // fast path done
+      }
+    } catch {}
 
-      // fetch clients
-      const cRes = await sheetCall("getClients");
-      if (cRes?.clients?.length) setClients(cRes.clients);
+    // Fetch fresh data in background
+    try {
+      const [uRes, cRes, tRes, sRes] = await Promise.all([
+        sheetCall("getUsers"),
+        sheetCall("getClients"),
+        sheetCall("getTasks"),
+        sheetCall("getSupplyDB"),
+      ]);
 
-      // fetch tasks
-      const tRes = await sheetCall("getTasks");
-      if (Array.isArray(tRes?.tasks)) setTasks(tRes.tasks);
+      const users    = uRes?.users?.length    ? uRes.users    : null;
+      const clients  = cRes?.clients?.length  ? cRes.clients  : null;
+      const tasks    = Array.isArray(tRes?.tasks) ? tRes.tasks : null;
+      const supplyDB = sRes?.supplyDB         ? sRes.supplyDB : null;
 
-      // fetch supply DB
-      const sRes = await sheetCall("getSupplyDB");
-      if (sRes?.supplyDB) setSupplyDB(sRes.supplyDB);
+      if (users)    setAllUsers(users);
+      if (clients)  setClients(clients);
+      if (tasks)    setTasks(tasks);
+      if (supplyDB) setSupplyDB(supplyDB);
+
+      // Save to cache
+      localStorage.setItem("galileo_cache", JSON.stringify({
+        users:    users    || allUsers,
+        clients:  clients  || clients,
+        tasks:    tasks    || [],
+        supplyDB: supplyDB || {},
+        cachedAt: Date.now()
+      }));
 
       setSheetId("connected");
       setSheetsStatus("ready");
-    } catch(e) { setSheetsStatus("error"); }
+    } catch { if (!background) setSheetsStatus("error"); }
   };
 
   // ══ Login ═════════════════════════════════════════════════════════
